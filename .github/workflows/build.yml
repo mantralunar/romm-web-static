@@ -111,7 +111,11 @@ jobs:
           fi
 
           echo "Frontend build completed successfully"
-          find romm/frontend/dist -maxdepth 2 -type f | head -50
+          echo "Build size:"
+          du -sh romm/frontend/dist
+
+          echo "Number of files:"
+          find romm/frontend/dist -type f | wc -l
 
       - name: Package frontend
         shell: bash
