@@ -1,0 +1,152 @@
+name: Build RomM Static Frontend
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Optional RomM version/tag to build, e.g. 5.3.1. Leave blank for latest stable."
+        required: false
+        type: string
+
+  schedule:
+    - cron: "17 */6 * * *"
+
+permissions:
+  contents: write
+
+jobs:
+  determine-version:
+    runs-on: ubuntu-latest
+
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      should_build: ${{ steps.check.outputs.should_build }}
+
+    steps:
+      - name: Determine RomM version
+        id: version
+        shell: bash
+        env:
+          MANUAL_VERSION: ${{ github.event.inputs.version }}
+        run: |
+          set -euo pipefail
+
+          if [ -n "${MANUAL_VERSION:-}" ]; then
+            VERSION="$MANUAL_VERSION"
+          else
+            VERSION="$(
+              curl -fsSL \
+                https://api.github.com/repos/rommapp/romm/releases/latest \
+              | jq -r '.tag_name'
+            )"
+          fi
+
+          if [ -z "$VERSION" ] || [ "$VERSION" = "null" ]; then
+            echo "Could not determine RomM version"
+            exit 1
+          fi
+
+          echo "RomM version: $VERSION"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+
+      - name: Check if release already exists
+        id: check
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          set -euo pipefail
+
+          if gh release view "$VERSION" \
+              --repo "$GITHUB_REPOSITORY" \
+              >/dev/null 2>&1; then
+
+            echo "Release $VERSION already exists"
+            echo "should_build=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "Release $VERSION does not exist"
+            echo "should_build=true" >> "$GITHUB_OUTPUT"
+          fi
+
+
+  build:
+    needs: determine-version
+
+    if: needs.determine-version.outputs.should_build == 'true'
+
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout RomM source
+        uses: actions/checkout@v4
+        with:
+          repository: rommapp/romm
+          ref: ${{ needs.determine-version.outputs.version }}
+          path: romm
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+          cache: npm
+          cache-dependency-path: romm/frontend/package-lock.json
+
+      - name: Install frontend dependencies
+        working-directory: romm/frontend
+        run: npm ci --ignore-scripts --no-audit --no-fund
+
+      - name: Build frontend
+        working-directory: romm/frontend
+        run: npm run build
+
+      - name: Verify build output
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if [ ! -f romm/frontend/dist/index.html ]; then
+            echo "Build failed: index.html was not created"
+            exit 1
+          fi
+
+          echo "Frontend build completed successfully"
+          find romm/frontend/dist -maxdepth 2 -type f | head -50
+
+      - name: Package frontend
+        shell: bash
+        env:
+          VERSION: ${{ needs.determine-version.outputs.version }}
+        run: |
+          set -euo pipefail
+
+          mkdir -p release
+
+          tar \
+            -C romm/frontend/dist \
+            -czf "release/romm-web-static-${VERSION}.tar.gz" \
+            .
+
+          cp \
+            "release/romm-web-static-${VERSION}.tar.gz" \
+            "release/romm-web-static.tar.gz"
+
+          sha256sum \
+            "release/romm-web-static-${VERSION}.tar.gz" \
+            > "release/romm-web-static-${VERSION}.tar.gz.sha256"
+
+      - name: Create GitHub release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ needs.determine-version.outputs.version }}
+        run: |
+          set -euo pipefail
+
+          gh release create "$VERSION" \
+            "release/romm-web-static-${VERSION}.tar.gz" \
+            "release/romm-web-static.tar.gz" \
+            "release/romm-web-static-${VERSION}.tar.gz.sha256" \
+            --repo "$GITHUB_REPOSITORY" \
+            --title "RomM Web ${VERSION}" \
+            --notes "Static RomM frontend built directly from rommapp/romm tag ${VERSION}."
